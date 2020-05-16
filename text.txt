@@ -1,85 +1,87 @@
-#include "so.h"
-#include <algorithm> 
-#include<stdlib.h> 
-#include<stdio.h> 
-#include <vector>
-#include "omp.h"
+__global__ void myppkernel(const float* r, float* d, int n, int nn) {
+    int ja = threadIdx.x;
+    int i = blockIdx.y;
 
-// eg how to use partition (return pivot)
-int highestPowerof2(int n) 
-{ 
-    int res = 0; 
-    for (int i=n; i>=1; i--) 
-    { 
-        // If i is a power of 2 
-        if ((i & (i-1)) == 0) 
-        { 
-            res = i; 
-            break; 
-        } 
-    } 
-    return res; 
-} 
+    float* t = d + nn * nn;
 
-data_t median(std::vector <data_t> &array, int n) {
-    nth_element(array.begin(), array.begin() + n/2, array.end());
-    return array[n/2];
+    for (int jb = 0; jb < nn; jb += 64) {
+        int j = jb + ja;
+        float v = (i < n && j < n) ? r[n*i + j] : HUGE_VALF;
+        d[nn*i + j] = v;
+        t[nn*j + i] = v;
+    }
 }
 
-void psort(int n, data_t* data) {
-    if(n < 2) {
-        return;
-    }
-    int n_threads = highestPowerof2(std::min(n,omp_get_max_threads()));
-    if(n_threads < 2) {
-        std::sort(data + 0, data + n);
-        return;
-    }
+__global__ void mykernel(float* r, const float* d, int n, int nn) {
+    int ia = threadIdx.x;
+    int ja = threadIdx.y;
+    int ic = blockIdx.x;
+    int jc = blockIdx.y;
 
-    std::vector <int> previousBound(n_threads + 1);
-    std::vector <int> currentBound(n_threads + 1);
-    std::vector <int> temp(n_threads + 1);
-    // initialize with a default partition 
-    previousBound[0] = 0;
-    data_t pivot = *std::next(data + 0, std::distance(data + 0,data + n)/2);
-    previousBound[1] = std::distance(
-        data + 0,
-        std::partition(data + 0, data + n,  [pivot](const data_t& em){ return em < pivot; })
-    );
-    previousBound[2] = n;
-    int size = 10000;
-    for (int noSegment = 2; noSegment < n_threads ; noSegment*=2) {
-        currentBound[0] = 0;
-        #pragma omp parallel for 
-        for(int i = 0; i < noSegment; i++) {
-            int range = previousBound[i+1] - previousBound[i];
-            if(range > size*5) {
-                std::vector <data_t> sample(size);
-                // malloc(sizeof(data_t)*10)
-                for(int j = 0; j <size; j+=1) {
-                    sample[j] = data[previousBound[i]+j*5];      
-                    // printf("sample index %d \n", previousBound[i]+j*5);             
-                }
-                nth_element(sample.begin(), sample.begin() + size/2, sample.end());
-                pivot = sample[size/2];
-            } else {
-                pivot = *std::next(data + 0, std::distance(data + previousBound[i], data + previousBound[i+1])/2);
-            }
-            
-            currentBound[i*2 +1] = std::distance(
-                data + 0,
-                std::partition (data + previousBound[i], data + previousBound[i+1],  [pivot](const data_t& em){ return em < pivot; }) 
-            );
-            currentBound[i*2 + 2] = previousBound[i+1];
+    const float* t = d + nn * nn;
+
+    float v[8][8];
+    for (int ib = 0; ib < 8; ++ib) {
+        for (int jb = 0; jb < 8; ++jb) {
+            v[ib][jb] = HUGE_VALF;
         }
-        previousBound = currentBound;
-        currentBound = temp;
+    }
+    for (int k = 0; k < n; ++k) {
+        float x[8];
+        float y[8];
+        for (int ib = 0; ib < 8; ++ib) {
+            int i = ic * 64 + ib * 8 + ia;
+            x[ib] = t[nn*k + i];
+        }
+        for (int jb = 0; jb < 8; ++jb) {
+            int j = jc * 64 + jb * 8 + ja;
+            y[jb] = d[nn*k + j];
+        }
+        for (int ib = 0; ib < 8; ++ib) {
+            for (int jb = 0; jb < 8; ++jb) {
+                v[ib][jb] = min(v[ib][jb], x[ib] + y[jb]);
+            }
+        }
+    }
+    for (int ib = 0; ib < 8; ++ib) {
+        for (int jb = 0; jb < 8; ++jb) {
+            int i = ic * 64 + ib * 8 + ia;
+            int j = jc * 64 + jb * 8 + ja;
+            if (i < n && j < n) {
+                r[n*i + j] = v[ib][jb];
+            }
+        }
+    }
+}
+
+void step(float* r, const float* d, int n) {
+    int nn = roundup(n, 64);
+
+    // Allocate memory & copy data to GPU
+    float* dGPU = NULL;
+    CHECK(cudaMalloc((void**)&dGPU, 2 * nn * nn * sizeof(float)));
+    float* rGPU = NULL;
+    CHECK(cudaMalloc((void**)&rGPU, n * n * sizeof(float)));
+    CHECK(cudaMemcpy(rGPU, d, n * n * sizeof(float), cudaMemcpyHostToDevice));
+
+    // Run kernel
+    {
+        dim3 dimBlock(64, 1);
+        dim3 dimGrid(1, nn);
+        myppkernel<<<dimGrid, dimBlock>>>(rGPU, dGPU, n, nn);
+        CHECK(cudaGetLastError());
     }
 
-    #pragma omp parallel for 
-    for (int segment = 0; segment < n_threads; ++segment) {
-        // printf("bound %d\n", previousBound[segment]);
-        std::sort(data + previousBound[segment], data + previousBound[segment + 1]);
+    // Run kernel
+    {
+        dim3 dimBlock(8, 8);
+        dim3 dimGrid(nn / 64, nn / 64);
+        mykernel<<<dimGrid, dimBlock>>>(rGPU, dGPU, n, nn);
+        CHECK(cudaGetLastError());
     }
 
+    // Copy data back to CPU & release memory
+    CHECK(cudaMemcpy(r, rGPU, n * n * sizeof(float), cudaMemcpyDeviceToHost));
+    CHECK(cudaFree(dGPU));
+    CHECK(cudaFree(rGPU));
 }
