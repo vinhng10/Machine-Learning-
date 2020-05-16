@@ -1,0 +1,100 @@
+#include "is.h"
+#include <vector>
+#include <iostream>
+#include "omp.h"
+#include "vector.h"
+#include <cmath>
+#include <algorithm>
+
+
+using namespace std;
+
+Result segment(int ny, int nx, const float* data) {
+    // input data, padded, converted to vectors
+    double4_t* dataVector = double4_alloc(ny*nx);
+
+    #pragma omp parallel for
+    for (int y = 0; y < ny; y++) {
+        for (int x = 0; x < nx; x++) {
+            for (int c = 0; c < 3; c++) {
+                dataVector[x + y*nx][c] = data[c + 3*x + 3*nx*y];
+            }
+        }
+    }
+
+    // Result result;
+    int max_threads = omp_get_max_threads();
+    std::vector < double > max_vector(max_threads, -1);
+    std::vector < Result > results_vector(max_threads);
+    // double max = -1;
+    
+    // cols after padding
+    int nx_p = nx + 1;
+    // rows after padding
+    int ny_p = ny + 1;
+
+    // s(0, 0, x, y, c)
+    double4_t* s = double4_alloc(ny_p*nx_p);
+    
+    // padding s[0, x] and s[y, 0] = 0
+    for (int x = 0; x < nx_p; x++) {
+        s[x] = double4_0;
+    }
+    for (int y = 0; y < ny_p; y++) {
+        s[y*nx_p] = double4_0;
+    }
+
+    // Calculate s[y, x] = s[y - 1, x] + s[y, x - 1] - s[y - 1, x - 1] + dataVector[y - 1, x - 1]
+    for (int y = 1; y < ny_p; y++) {
+        for (int x = 1; x < nx_p; x++) {
+            s[x + y*nx_p] = s[x + (y - 1)*nx_p] + s[(x - 1) + y*nx_p] - s[(x - 1) + (y - 1)*nx_p] + dataVector[(x - 1) + (y - 1)*nx];
+        }
+    }
+
+    double P = (double) ny_p * nx_p;
+    double4_t vP_c = s[(int) P - 1];
+
+    double totalDivisor = ny * nx;
+
+    // Calculate h(X, Y) - Find max h
+    #pragma omp parallel for
+    for (int y0 = 0; y0 < ny; y0++) {
+        int current_thread = omp_get_thread_num();
+        for (int x0 = 0; x0 < nx; x0++) {
+            for (int y1 = y0 + 1; y1 < ny_p; y1++) {
+                for (int x1 = x0 + 1; x1 < nx_p; x1++) {
+                    double4_t vX_c = s[x1 + y1*nx_p] - s[x0 + y1*nx_p] - s[x1 + y0*nx_p] + s[x0 + y0*nx_p];
+                    double4_t vY_c = vP_c - vX_c;
+                    double absX = (double) (y1 - y0) * (x1 - x0);
+                    double absY = totalDivisor - absX;
+                    double4_t v_hX_Y = (vX_c * vX_c) / absX + (vY_c * vY_c) / absY;
+                    double hX_Y = 0.0;
+                    for (int i = 0; i < 3; i++) {
+                        hX_Y += v_hX_Y[i];
+                    }
+                    if (hX_Y > max_vector[current_thread]) {
+                        double4_t ac_star = vX_c / absX;
+                        double4_t bc_star = vY_c / absY;
+                        // results_vector[current_thread] =  Result result { y0, x0, y1, x1, ac_star[i], bc_star[i]};
+                        results_vector[current_thread].y0 = y0;
+                        results_vector[current_thread].x0 = x0;
+                        results_vector[current_thread].y1 = y1;
+                        results_vector[current_thread].x1 = x1;
+                        for (int i = 0; i < 3; i++) {
+                            results_vector[current_thread].inner[i] = ac_star[i];
+                            results_vector[current_thread].outer[i] = bc_star[i];
+                        }
+                        max_vector[current_thread] = hX_Y;
+                    } 
+                }
+            }
+        }
+    }
+    int max_index = std::distance(max_vector.begin(),  std::max_element(max_vector.begin(), max_vector.end()));
+
+    free(dataVector);
+    free(s);
+    // find index of max
+    
+    return results_vector[max_index];
+}
