@@ -1,37 +1,25 @@
-__global__ void myppkernel(const float* r, float* d, int n, int nn) {
-    int ja = threadIdx.x;
-    int i = blockIdx.y;
-
-    float* t = d + nn * nn;
-
-    for (int jb = 0; jb < nn; jb += 64) {
-        int j = jb + ja;
-        float v = (i < n && j < n) ? r[n*i + j] : HUGE_VALF;
-        d[nn*i + j] = v;
-        t[nn*j + i] = v;
-    }
-}
-
-__global__ void mykernel(float* r, const float* d, int n, int nn) {
+__global__ void calculateMatrixProduct(int ny, int nx, int nn, float* result, float* d) {
     int ia = threadIdx.x;
     int ja = threadIdx.y;
     int ic = blockIdx.x;
     int jc = blockIdx.y;
 
-    const float* t = d + nn * nn;
+    if (jc < ic) {
+        return;
+    }
 
     float v[8][8];
     for (int ib = 0; ib < 8; ++ib) {
         for (int jb = 0; jb < 8; ++jb) {
-            v[ib][jb] = HUGE_VALF;
+            v[ib][jb] = 0;
         }
     }
-    for (int k = 0; k < n; ++k) {
+    for (int k = 0; k < nx; ++k) {
         float x[8];
         float y[8];
         for (int ib = 0; ib < 8; ++ib) {
             int i = ic * 64 + ib * 8 + ia;
-            x[ib] = t[nn*k + i];
+            x[ib] = d[nn*k + i];
         }
         for (int jb = 0; jb < 8; ++jb) {
             int j = jc * 64 + jb * 8 + ja;
@@ -39,7 +27,7 @@ __global__ void mykernel(float* r, const float* d, int n, int nn) {
         }
         for (int ib = 0; ib < 8; ++ib) {
             for (int jb = 0; jb < 8; ++jb) {
-                v[ib][jb] = min(v[ib][jb], x[ib] + y[jb]);
+                v[ib][jb] += x[ib]*y[jb];
             }
         }
     }
@@ -47,41 +35,56 @@ __global__ void mykernel(float* r, const float* d, int n, int nn) {
         for (int jb = 0; jb < 8; ++jb) {
             int i = ic * 64 + ib * 8 + ia;
             int j = jc * 64 + jb * 8 + ja;
-            if (i < n && j < n) {
-                r[n*i + j] = v[ib][jb];
+            if (i < ny && j < ny) {
+                result[ny*i + j] = v[ib][jb];
             }
         }
     }
 }
+__global__ void calculateMatrixProductPp(int ny, int nx, int nn, float* paddedData, float* tempData) {
+    int ja = threadIdx.x;
+    int i = blockIdx.y;
 
-void step(float* r, const float* d, int n) {
-    int nn = roundup(n, 64);
 
+    for (int jb = 0; jb < nn; jb += 64) {
+        int j = jb + ja;
+        float v = (j < ny && i < nx) ? tempData[nx*j + i] : 0;
+        paddedData[nn*i + j] = v;
+
+    }
+}
+
+int lol() {
+    int nn = roundup(ny, 64);
     // Allocate memory & copy data to GPU
-    float* dGPU = NULL;
-    CHECK(cudaMalloc((void**)&dGPU, 2 * nn * nn * sizeof(float)));
-    float* rGPU = NULL;
-    CHECK(cudaMalloc((void**)&rGPU, n * n * sizeof(float)));
-    CHECK(cudaMemcpy(rGPU, d, n * n * sizeof(float), cudaMemcpyHostToDevice));
+
+    float* resultCuda = NULL;
+    CHECK(cudaMalloc((void**)&resultCuda, ny * ny * sizeof(float)));
+    float* tempCuda = NULL;
+    CHECK(cudaMalloc((void**)&tempCuda, ny * nx * sizeof(float)));
+    float* paddedData = NULL;
+    CHECK(cudaMalloc((void**)&paddedData, nx * nn * sizeof(float)));
+
+    CHECK(cudaMemcpy(tempCuda, &temp[0], ny * nx * sizeof(float), cudaMemcpyHostToDevice));
 
     // Run kernel
     {
-        dim3 dimBlock(64, 1);
-        dim3 dimGrid(1, nn);
-        myppkernel<<<dimGrid, dimBlock>>>(rGPU, dGPU, n, nn);
+        dim3 dimBlock(64, 1); //dim3 dimBlock(64, 1);
+        dim3 dimGrid(1, nx);
+        calculateMatrixProductPp<<<dimGrid, dimBlock>>>(ny, nx, nn, paddedData, tempCuda);
         CHECK(cudaGetLastError());
     }
 
     // Run kernel
     {
         dim3 dimBlock(8, 8);
-        dim3 dimGrid(nn / 64, nn / 64);
-        mykernel<<<dimGrid, dimBlock>>>(rGPU, dGPU, n, nn);
+        dim3 dimGrid(divup(ny, 64), divup(ny, 64));
+        calculateMatrixProduct<<<dimGrid, dimBlock>>>(ny, nx, nn, resultCuda, paddedData);
         CHECK(cudaGetLastError());
     }
 
     // Copy data back to CPU & release memory
-    CHECK(cudaMemcpy(r, rGPU, n * n * sizeof(float), cudaMemcpyDeviceToHost));
-    CHECK(cudaFree(dGPU));
-    CHECK(cudaFree(rGPU));
+    CHECK(cudaMemcpy(result, resultCuda, ny * ny * sizeof(float), cudaMemcpyDeviceToHost));
+    CHECK(cudaFree(resultCuda));
+    CHECK(cudaFree(tempCuda));
 }
